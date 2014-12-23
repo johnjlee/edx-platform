@@ -47,6 +47,11 @@ class TestVideoAPITestCase(MobileAPITestCase):
             metadata={'graded': True, 'format': 'Homework'},
             display_name=None,
         )
+        self.split_unit = ItemFactory.create(
+            parent_location=self.sub_section.location,
+            category="vertical",
+            display_name=u"split test vertical\u03a9",
+        )
 
         self.edx_video_id = 'testing-123'
 
