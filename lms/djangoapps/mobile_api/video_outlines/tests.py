@@ -52,6 +52,11 @@ class TestVideoAPITestCase(MobileAPITestCase):
             category="vertical",
             display_name=u"split test vertical\u03a9",
         )
+        self.split_test = ItemFactory.create(
+            parent_location=self.split_unit.location,
+            category="split_test",
+            display_name=u"split test unit"
+        )
 
         self.edx_video_id = 'testing-123'
 
