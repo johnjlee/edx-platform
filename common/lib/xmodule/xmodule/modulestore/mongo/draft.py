@@ -25,6 +25,9 @@ from search.manager import SearchEngine
 
 log = logging.getLogger(__name__)
 
+# Use default index and document names for now
+INDEX_NAME = "courseware_index"
+DOCUMENT_TYPE = "courseware_content"
 
 def wrap_draft(item):
     """
@@ -621,25 +624,27 @@ class DraftModuleStore(MongoModuleStore):
             return False
 
     def do_index(self, location, delete=False):
+        """
+        Main routine to index (for purposes of searching) from given location and other stuff on down
+        """
         # TODO - inline for now, need to move this out to a celery task
-        INDEX_NAME = "courseware_index"
-        DOCUMENT_TYPE = "courseware_content"
-
         searcher = SearchEngine.get_search_engine(INDEX_NAME)
         location_info = {
             "course": unicode(location.course_key),
         }
 
         def _fetch_item(item_location):
+            """ Fetch the item from the modulestore location, log if not found, but continue """
             try:
                 item = self.get_item(item_location, revision=ModuleStoreEnum.RevisionOption.published_only)
-            except:
+            except ItemNotFoundError:
                 log.warning('Cannot find: %s', item_location)
                 return None
 
             return item
 
         def index_item_location(item_location):
+            """ add this item to the search index """
             item = _fetch_item(item_location)
             if item:
                 if item.has_children:
@@ -655,6 +660,7 @@ class DraftModuleStore(MongoModuleStore):
                 searcher.index(DOCUMENT_TYPE, item_index)
 
         def remove_index_item_location(item_location):
+            """ remove this item from the search index """
             item = _fetch_item(item_location)
             if item:
                 if item.has_children:
