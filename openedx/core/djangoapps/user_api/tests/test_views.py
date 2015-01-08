@@ -565,7 +565,7 @@ class PreferenceUsersListViewTest(UserApiTestCase):
 
 @ddt.ddt
 @skipUnless(settings.ROOT_URLCONF == 'lms.urls', 'Test only valid in lms')
-class LoginSessionViewTest(ApiTestCase):
+class LoginSessionViewTest(ApiTestCase, TestCase):
     """Tests for the login end-points of the user API. """
 
     USERNAME = "bob"
@@ -776,7 +776,7 @@ class PasswordResetViewTest(ApiTestCase):
 
 @ddt.ddt
 @skipUnless(settings.ROOT_URLCONF == 'lms.urls', 'Test only valid in lms')
-class RegistrationViewTest(ApiTestCase):
+class RegistrationViewTest(ApiTestCase, TestCase):
     """Tests for the registration end-points of the User API. """
 
     USERNAME = "bob"
