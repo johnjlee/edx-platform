@@ -190,39 +190,45 @@ class TestVideoSummaryList(TestVideoAPITestCase, MobileAuthTestMixin, MobileEnro
         We are expecting to return the same unit and section url since there is
         no unit vertical.
         """
+        self.login_and_enroll()
         ItemFactory.create(
             parent_location=self.sub_section.location,
             category="video",
             edx_video_id=self.edx_video_id,
-            display_name=u"test draft video omega 2 \u03a9"
+            display_name=u"video in the sub section"
         )
-        course_outline = self._get_video_summary_list()
+        course_outline = self.api_response().data
         self.assertEqual(len(course_outline), 1)
         self.assertEqual(len(course_outline[0]['path']), 2)
-        self.assertEqual(course_outline[0]["section_url"], course_outline[0]["unit_url"])
+        section_url = course_outline[0]["section_url"]
+        unit_url = course_outline[0]["unit_url"]
+        self.assertEqual(
+            section_url,
+            u'http://testserver/courses/org.0/course_0/Run_0/courseware/test_factory_section_omega_%CE%A9/test_subsection_omega_%CE%A9/'
+        )
+        self.assertTrue(section_url)
+        self.assertTrue(unit_url)
+        self.assertEqual(section_url, unit_url)
 
     def test_with_split_test(self):
-        self.split_test = ItemFactory.create(
-            parent_location=self.split_unit.location,
-            category="split_test",
-            display_name=u"split test unit"
+        self.login_and_enroll()
+
+        ItemFactory.create(
+            parent_location=self.split_test.location,
+            category="video",
+            display_name=u"split test video a",
         )
         ItemFactory.create(
             parent_location=self.split_test.location,
             category="video",
-            display_name=u"split test vertical a",
+            display_name=u"split test video b",
         )
-        ItemFactory.create(
-            parent_location=self.split_test.location,
-            category="video",
-            display_name=u"split test vertical b",
-        )
-        course_outline = self._get_video_summary_list()
+        course_outline = self.api_response().data
         self.assertEqual(len(course_outline), 2)
         self.assertEqual(len(course_outline[0]["path"]), 4)
         self.assertEqual(len(course_outline[1]["path"]), 4)
-        self.assertEqual(course_outline[0]["summary"]["name"], u"split test vertical a")
-        self.assertEqual(course_outline[1]["summary"]["name"], u"split test vertical b")
+        self.assertEqual(course_outline[0]["summary"]["name"], u"split test video a")
+        self.assertEqual(course_outline[1]["summary"]["name"], u"split test video b")
 
     def test_with_hidden_blocks(self):
         self.login_and_enroll()

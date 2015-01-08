@@ -63,14 +63,13 @@ class BlockOutline(object):
                 block_path.append(block)
 
             block_list = list(reversed(block_path))
+            block_count = len(block_list)
 
-            n = len(block_list)  # pylint: disable=C0103
-
-            chapter = block_list[1].location.block_id if n > 1 else None
-            section = block_list[2] if n > 2 else None
+            chapter = block_list[1] if block_count > 1 else None
+            section = block_list[2] if block_count > 2 else None
             position = ""
 
-            if n > 3:
+            if block_count > 3:
                 position = 1
                 for block in section.children:
                     if block.name == block_list[3].url_name:
@@ -78,8 +77,8 @@ class BlockOutline(object):
                     position += 1
 
             kwargs = dict(
-                course_id=self.course_id,
-                chapter=chapter,
+                course_id=unicode(self.course_id),
+                chapter=chapter.url_name,
                 section=section.url_name
             )
             section_url = reverse(
