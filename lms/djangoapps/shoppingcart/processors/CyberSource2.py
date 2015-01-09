@@ -29,15 +29,16 @@ import logging
 import requests
 import csv
 import StringIO
+import pytz
 from textwrap import dedent
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import OrderedDict, defaultdict
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from django.conf import settings
 from django.utils.translation import ugettext as _
 from edxmako.shortcuts import render_to_string
-from shoppingcart.models import Order, PaymentProcessorTransaction
+from shoppingcart.models import Order, PaymentProcessorTransaction, TRANSACTION_TYPE_PURCHASE, TRANSACTION_TYPE_REFUND
 from shoppingcart.processors.exceptions import *
 from shoppingcart.processors.helpers import get_processor_config
 from microsite_configuration import microsite
@@ -659,7 +660,7 @@ REASONCODE_MAP.update(
 )
 
 
-def sychronize_transactions(start_date, end_date):
+def synchronize_transactions(start_date, end_date):
     """
     Concrete implementation of the API. This will call out to CyberSource Secure Acceptance
     Batch Processing Detail Report which can be provided on a daily basis
@@ -686,7 +687,9 @@ def sychronize_transactions(start_date, end_date):
         errs.extend(_errs)
 
         # go to next day
-        cur_date = cur_date + datetime.timedelta(1)
+        cur_date = cur_date + timedelta(1)
+
+    return num_processed, num_in_err, errs
 
 
 RECEIVED_REPORT_FIELD_NAMES = [
@@ -745,12 +748,13 @@ def get_report_data(date):
     """
 
     # get the 'root' account information
-    account_name = settings.CC_PROCESSOR['CyberSource2']['REPORTING_ACCOUNT_NAME']
-    data = get_report_data_for_account(
-        account_name,
-        settings.CC_PROCESSOR['CyberSource2'],
-        date
-    )
+    account_name = settings.CC_PROCESSOR['CyberSource2'].get('REPORTING_ACCOUNT_NAME')
+    if account_name:
+        data = get_report_data_for_account(
+            account_name,
+            settings.CC_PROCESSOR['CyberSource2'],
+            date
+        )
 
     # keep track of which accounts we've processed
     processed_accounts = [account_name]
@@ -759,7 +763,10 @@ def get_report_data(date):
     # accounts since multiple microsites might use the same CyberSource account
     for microsite_key in settings.CC_PROCESSOR['CyberSource2'].get('microsites', {}):
         config = settings.CC_PROCESSOR['CyberSource2']['microsites'][microsite_key]
-        account_name = config['REPORTING_ACCOUNT_NAME']
+        account_name = config.get('REPORTING_ACCOUNT_NAME')
+
+        if not account_name:
+            continue
 
         if account_name not in processed_accounts:
             _data = get_report_data_for_account(account_name, config, date)
@@ -782,35 +789,36 @@ def process_report_data(data):
         remote_transaction_id = row['trans_ref_no']
         try:
             account_id = row['merchant_id']
-            processed_at = datetime.datetime.strptime(row['batch_date'], 'MM/D/YY')
+            processed_at = datetime.strptime(row['batch_date'], '%m/%d/%y')
+            processed_at = processed_at.replace(tzinfo=pytz.UTC)
             order_id = int(row['merchant_ref_number'])
             currency = row['currency']
             amount = float(row['amount'])
             _type = row['transaction_type']
 
             if _type == 'ics_bill':
-                transaction_type = TRANSACTION_TYPE_PURCHASED
+                transaction_type = TRANSACTION_TYPE_PURCHASE
             elif _type == 'ics_credit':
-                transaction_type = TRANSACTION_TYPE_REFUNDED
+                transaction_type = TRANSACTION_TYPE_REFUND
             else:
                 raise Exception('Unknown transaction_type received: {transaction_type}'.format(transaction_type=_type))
 
             transaction = PaymentProcessorTransaction.create(
                 remote_transaction_id,
                 account_id,
-                process_at,
+                processed_at,
                 order_id,
                 currency,
                 amount,
                 transaction_type
             )
-            rows_processed = row_processed + 1
+            rows_processed = rows_processed + 1
         except Exception, e:
             rows_in_error = rows_in_error + 1
             errors.append({
                 'remote_transaction_id': remote_transaction_id,
                 'raw_data': row,
-                'err_msg': e.message
+                'err_msg': repr(e)
             })
 
     return rows_processed, rows_in_error, errors

@@ -8,9 +8,24 @@ from django.test import TestCase
 from django.conf import settings
 import ddt
 from django.test.utils import override_settings
+import pytz
+
+from course_modes.models import CourseMode
+from xmodule.modulestore.tests.factories import CourseFactory
 
 from student.tests.factories import UserFactory
-from shoppingcart.models import Order, OrderItem
+
+from shoppingcart.models import (
+    Order,
+    OrderItem,
+    PaidCourseRegistration,
+    PaymentProcessorTransaction,
+    TRANSACTION_TYPE_PURCHASE,
+    TRANSACTION_TYPE_REFUND
+)
+
+from shoppingcart.sync import perform_sync
+
 from shoppingcart.processors.CyberSource2 import (
     processor_hash,
     process_postpay_callback,
@@ -462,6 +477,14 @@ class CyberSource2Test(TestCase):
             "REPORTING_ACCOUNT_NAME": "first",
             "REPORTING_AUTH_USERNAME": "dummy",
             "REPORTING_AUTH_PASSWORD": "dummy",
+        }
+    }
+    TEST_REPORTING_CC_PROCESSOR_MICROSITES = {
+        'CyberSource2': {
+            "REPORTING_BASE_ENDPOINT": "dummy",
+            "REPORTING_ACCOUNT_NAME": "first",
+            "REPORTING_AUTH_USERNAME": "dummy",
+            "REPORTING_AUTH_PASSWORD": "dummy",
             "microsites" : {
                 'foo': {
                     "REPORTING_BASE_ENDPOINT": "dummy",
@@ -477,13 +500,16 @@ class CyberSource2Test(TestCase):
                     "REPORTING_AUTH_USERNAME": "dummy",
                     "REPORTING_AUTH_PASSWORD": "dummy",
                 },
+                'baz': {
+                    # leave an empty one to make sure we skip it
+                },
             }
         }
     }
 
     @override_settings(
         CC_PROCESSOR_NAME=TEST_REPORTING_CC_PROCESSOR_NAME,
-        CC_PROCESSOR=TEST_REPORTING_CC_PROCESSOR
+        CC_PROCESSOR=TEST_REPORTING_CC_PROCESSOR_MICROSITES
     )
     def test_get_report_data(self):
         """
@@ -514,7 +540,7 @@ class CyberSource2Test(TestCase):
                 'merchant_ref_number': '1000',
                 'currency': 'USD',
                 'amount': '100',
-                'type': 'ics_bill',
+                'transaction_type': 'ics_bill',
                 'trans_ref_no': '100',
             },
             {
@@ -523,13 +549,332 @@ class CyberSource2Test(TestCase):
                 'merchant_ref_number': '1001',
                 'currency': 'USD',
                 'amount': '20.50',
-                'type': 'ics_bill',
+                'transaction_type': 'ics_bill',
                 'trans_ref_no': '101',
             },
         ]
 
         num_processed, num_in_err, errors = process_report_data(test_data)
 
+        # since none of the OrderId's can be found, they should all be counted as errors
         self.assertEqual(num_processed, 0)
         self.assertEqual(num_in_err, 2)
         self.assertEqual(len(errors), 2)
+
+    def _set_up_purchased_order(self, cost=40):
+        """
+        This is a helper method to set up a course with a price and purchase it
+        """
+
+        user = UserFactory.create()
+
+        course = CourseFactory.create()
+        course_key = course.id
+        course_mode = CourseMode(course_id=course_key,
+                                      mode_slug="honor",
+                                      mode_display_name="honor cert",
+                                      min_price=cost)
+        course_mode.save()
+
+        order = Order.get_cart_for_user(user)
+        PaidCourseRegistration.add_to_order(order, course_key)
+        order.purchase()
+
+        return order, course
+
+    def test_process_report_data_with_orders(self):
+        """
+        This will verify processing data that has corresponding Orders
+        """
+
+        order, course = self._set_up_purchased_order()
+        order2, course2  = self._set_up_purchased_order(100)
+
+        test_data = [
+            {
+                'merchant_id': 'foo',
+                'batch_date': '1/2/15',
+                'merchant_ref_number': str(order.id),
+                'currency': 'USD',
+                'amount': str(order.total_cost),
+                'transaction_type': 'ics_bill',
+                'trans_ref_no': '100',
+            },
+            {
+                'merchant_id': 'foo',
+                'batch_date': '1/2/15',
+                'merchant_ref_number': str(order.id),
+                'currency': 'USD',
+                'amount': str(-order.total_cost),
+                'transaction_type': 'ics_credit',
+                'trans_ref_no': '101',
+            },
+            {
+                'merchant_id': 'foo',
+                'batch_date': '1/2/15',
+                'merchant_ref_number': str(order2.id),
+                'currency': 'USD',
+                'amount': str(order2.total_cost),
+                'transaction_type': 'ics_bill',
+                'trans_ref_no': '102',
+            },
+        ]
+
+        num_processed, num_in_err, errors = process_report_data(test_data)
+
+        # since none of the OrderId's can be found, they should all be counted as errors
+        self.assertEqual(num_processed, 3)
+        self.assertEqual(num_in_err, 0)
+        self.assertEqual(len(errors), 0)
+
+        # verify that we have saved PaymentProcessorTransactions
+        self.assertEqual(len(PaymentProcessorTransaction.objects.all()), 3)
+
+        trans = PaymentProcessorTransaction.get_by_remote_transaction_id('100')
+        self.assertEqual(trans.transaction_type, TRANSACTION_TYPE_PURCHASE)
+        self.assertEqual(trans.account_id, 'foo')
+        self.assertEqual(trans.order.id, order.id)
+        self.assertEqual(trans.currency, 'USD')
+        self.assertEqual(trans.amount, order.total_cost)
+        self.assertEqual(trans.processed_at, datetime.datetime(2015, 1, 2, tzinfo=pytz.UTC))
+
+        trans = PaymentProcessorTransaction.get_by_remote_transaction_id('101')
+        self.assertEqual(trans.transaction_type, TRANSACTION_TYPE_REFUND)
+
+        # now verify that we have transaction to course mappings
+        course_transactions = PaymentProcessorTransaction.get_transactions_for_course(course.id)
+        self.assertEqual(len(course_transactions.all()), 2)
+
+        course_transactions = PaymentProcessorTransaction.get_transactions_for_course(course2.id)
+        self.assertEqual(len(course_transactions.all()), 1)
+
+        # very that transaction aggregations are as expected
+        amounts = PaymentProcessorTransaction.get_transaction_totals_for_course(course.id)
+        self.assertEqual(amounts['purchased'], order.total_cost)
+        self.assertEqual(amounts['refunded'], -order.total_cost)
+
+        amounts = PaymentProcessorTransaction.get_transaction_totals_for_course(course2.id)
+        self.assertEqual(amounts['purchased'], order2.total_cost)
+        self.assertEqual(amounts['refunded'], 0.0)
+
+    def test_mismatched_totals(self):
+        """
+        This will verify that we will flag any transactions whose totals don't match up to the Invoice
+        """
+
+        order, course = self._set_up_purchased_order()
+
+        test_data = [
+            {
+                'merchant_id': 'foo',
+                'batch_date': '1/2/15',
+                'merchant_ref_number': str(order.id),
+                'currency': 'USD',
+                'amount': str(order.total_cost+10),
+                'transaction_type': 'ics_bill',
+                'trans_ref_no': '100',
+            },
+        ]
+
+        num_processed, num_in_err, errors = process_report_data(test_data)
+
+        # since none of the OrderId's can be found, they should all be counted as errors
+        self.assertEqual(num_processed, 0)
+        self.assertEqual(num_in_err, 1)
+        self.assertEqual(len(errors), 1)
+
+    def test_mismatched_refund_totals(self):
+        """
+        This will verify that we will flag any refunds whose totals don't match up to the Invoice
+        """
+
+        order, course = self._set_up_purchased_order()
+
+        test_data = [
+            {
+                'merchant_id': 'foo',
+                'batch_date': '1/2/15',
+                'merchant_ref_number': str(order.id),
+                'currency': 'USD',
+                'amount': str(order.total_cost),
+                'transaction_type': 'ics_bill',
+                'trans_ref_no': '100',
+            },
+            {
+                'merchant_id': 'foo',
+                'batch_date': '1/2/15',
+                'merchant_ref_number': str(order.id),
+                'currency': 'USD',
+                'amount': str(-order.total_cost+10),
+                'transaction_type': 'ics_credit',
+                'trans_ref_no': '101',
+            },
+        ]
+
+        num_processed, num_in_err, errors = process_report_data(test_data)
+
+        # since none of the OrderId's can be found, they should all be counted as errors
+        self.assertEqual(num_processed, 1)
+        self.assertEqual(num_in_err, 1)
+        self.assertEqual(len(errors), 1)
+
+    def test_process_report_data_multi(self):
+        """
+        This will assert that the course mappings on an order which has multiple course_modes
+        will properly spread out the sums
+        """
+
+        user = UserFactory.create()
+
+        course = CourseFactory.create()
+        course_mode = CourseMode(course_id=course.id,
+                                      mode_slug="honor",
+                                      mode_display_name="honor cert",
+                                      min_price=40)
+        course_mode.save()
+
+        course2 = CourseFactory.create()
+        course_mode = CourseMode(course_id=course2.id,
+                                      mode_slug="honor",
+                                      mode_display_name="honor cert",
+                                      min_price=100)
+        course_mode.save()
+
+        order = Order.get_cart_for_user(user)
+        PaidCourseRegistration.add_to_order(order, course.id)
+        PaidCourseRegistration.add_to_order(order, course2.id)
+        order.purchase()
+
+        test_data = [
+            {
+                'merchant_id': 'foo',
+                'batch_date': '1/2/15',
+                'merchant_ref_number': str(order.id),
+                'currency': 'USD',
+                'amount': str(order.total_cost),
+                'transaction_type': 'ics_bill',
+                'trans_ref_no': '100',
+            },
+        ]
+
+        num_processed, num_in_err, errors = process_report_data(test_data)
+
+        # since none of the OrderId's can be found, they should all be counted as errors
+        self.assertEqual(num_processed, 1)
+        self.assertEqual(num_in_err, 0)
+        self.assertEqual(len(errors), 0)
+
+        # verify that we have saved PaymentProcessorTransactions
+        self.assertEqual(len(PaymentProcessorTransaction.objects.all()), 1)
+
+        # see that the aggregates are as expected
+        # very that transaction aggregations are as expected
+        amounts = PaymentProcessorTransaction.get_transaction_totals_for_course(course.id)
+        self.assertEqual(amounts['purchased'], 40)
+        self.assertEqual(amounts['refunded'], 0.0)
+
+        amounts = PaymentProcessorTransaction.get_transaction_totals_for_course(course2.id)
+        self.assertEqual(amounts['purchased'], 100)
+        self.assertEqual(amounts['refunded'], 0.0)
+
+    def _setup_purchases(self):
+        """
+        Helper method to set up some test information
+        """
+        user = UserFactory.create()
+
+        course = CourseFactory.create()
+        course_mode = CourseMode(course_id=course.id,
+                                      mode_slug="honor",
+                                      mode_display_name="honor cert",
+                                      min_price=40)
+        course_mode.save()
+
+        course2 = CourseFactory.create()
+        course_mode = CourseMode(course_id=course2.id,
+                                      mode_slug="honor",
+                                      mode_display_name="honor cert",
+                                      min_price=100)
+        course_mode.save()
+
+        order = Order.get_cart_for_user(user)
+        PaidCourseRegistration.add_to_order(order, course.id)
+        order.purchase()
+
+        order2 = Order.get_cart_for_user(user)
+        PaidCourseRegistration.add_to_order(order2, course2.id)
+        order2.purchase()
+
+        return order, order2, course, course2
+
+    @override_settings(
+        CC_PROCESSOR_NAME=TEST_REPORTING_CC_PROCESSOR_NAME,
+        CC_PROCESSOR=TEST_REPORTING_CC_PROCESSOR
+    )
+    def test_perform_sync(self):
+        """
+        This verifies getting report data over all accounts defined in the configuration
+        """
+
+        order, order2, course, course2 = self._setup_purchases()
+
+        test_csv_data ="""header\n
+        batch_id,merchant_id, batch_date,request_id,merchant_ref_number,trans_ref_no,payment_method,currency,amount,transaction_type\n
+        1,foo_account,1/1/15,1,{order_id},1,Visa,USD,40,ics_bill\n
+        2,foo_account,1/1/15,1,{order2_id},2,Visa,USD,100,ics_bill\n
+        4,foo_account,1/1/15,1,{order_id},4,Visa,USD,-40,ics_credit""".format(
+            order_id=order.id,
+            order2_id=order2.id,
+        )
+
+        with patch('shoppingcart.processors.CyberSource2.requests') as mock_requests:
+            print
+            mock_requests.get.return_value = mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.content = test_csv_data
+
+            sync_op = perform_sync()
+
+        self.assertEqual(sync_op.rows_processed, 3)
+        self.assertEqual(sync_op.rows_in_error, 0)
+
+        # see that the aggregates are as expected
+        # very that transaction aggregations are as expected
+        amounts = PaymentProcessorTransaction.get_transaction_totals_for_course(course.id)
+        self.assertEqual(amounts['purchased'], 40)
+        self.assertEqual(amounts['refunded'], -40.0)
+
+        amounts = PaymentProcessorTransaction.get_transaction_totals_for_course(course2.id)
+        self.assertEqual(amounts['purchased'], 100)
+        self.assertEqual(amounts['refunded'], 0.0)
+
+    @override_settings(
+        CC_PROCESSOR_NAME=TEST_REPORTING_CC_PROCESSOR_NAME,
+        CC_PROCESSOR=TEST_REPORTING_CC_PROCESSOR
+    )
+    def test_perform_sync_missing_order(self):
+        """
+        This verifies getting report data over all accounts defined in the configuration
+        """
+
+        order, order2, course, course2 = self._setup_purchases()
+
+        test_csv_data ="""header\n
+        batch_id,merchant_id, batch_date,request_id,merchant_ref_number,trans_ref_no,payment_method,currency,amount,transaction_type\n
+        1,foo_account,1/1/15,1,{order_id},1,Visa,USD,40,ics_bill\n
+        2,foo_account,1/1/15,1,{order2_id},2,Visa,USD,100,ics_bill\n
+        4,foo_account,1/1/15,1,0,3,Visa,USD,100,ics_bill""".format(
+            order_id=order.id,
+            order2_id=order2.id,
+        )
+
+        with patch('shoppingcart.processors.CyberSource2.requests') as mock_requests:
+            print
+            mock_requests.get.return_value = mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.content = test_csv_data
+
+            sync_op = perform_sync()
+
+        self.assertEqual(sync_op.rows_processed, 2)
+        self.assertEqual(sync_op.rows_in_error, 1)

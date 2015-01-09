@@ -1622,7 +1622,7 @@ class PaymentProcessorTransaction(TimeStampedModel):
 
     # The timestamp associated with when the payment processing
     # occured
-    processed_at = models.DateTimeField()
+    processed_at = models.DateTimeField(db_index=True)
 
     # the Order model that this processing is associated with
     order = models.ForeignKey(Order, db_index=True)
@@ -1679,7 +1679,7 @@ class PaymentProcessorTransaction(TimeStampedModel):
 
         if exists:
             # see if an already existing row is *exactly* the same
-            existing = PaymentProcessorTransaction.objects.get(remote_transaction_id=remote_transaction_id)
+            existing = cls.get_by_remote_transaction_id(remote_transaction_id)
 
             if transaction != existing:
                 raise IntegrityError("Attempting to change an existing transaction ({transaction_id}). This is not allowed!".format(transaction_id=remote_transaction_id))
@@ -1690,6 +1690,13 @@ class PaymentProcessorTransaction(TimeStampedModel):
             transaction.save()
 
         return transaction
+
+    @classmethod
+    def get_by_remote_transaction_id(cls, remote_transaction_id):
+        """
+        This will return a PaymentProcessorTransaction by the remote_transaction_id
+        """
+        return PaymentProcessorTransaction.objects.get(remote_transaction_id=remote_transaction_id)
 
     @classmethod
     def get_transactions_for_course(cls, course_key, transaction_type=None, start=None, end=None):
@@ -1773,6 +1780,8 @@ class PaymentProcessorTransaction(TimeStampedModel):
                 raise ValidationError('remote_transaction_id {} has refund amount of {} but Order {} has a sum of {}'.format(
                     self.remote_transaction_id, self.amount, self.order.id, total
                 ))
+        else:
+            raise ValidationError('Unknown transaction_type = {}'.format(self.transaction_type))
 
 
 @receiver(pre_save, sender=PaymentProcessorTransaction)
@@ -1844,9 +1853,6 @@ class PaymentTransactionSync(TimeStampedModel):
     # end date of extract
     date_range_end = models.DateTimeField(db_index=True)
 
-    # how many rows received
-    row_received = models.IntegerField()
-
     # how many rows were successfully synced
     rows_processed = models.IntegerField()
 
@@ -1854,12 +1860,19 @@ class PaymentTransactionSync(TimeStampedModel):
     # there should be a corresponding entry in the PaymentTransactionSyncError table
     rows_in_error = models.IntegerField()
 
-    # the start and end Id numbers of the corresponding rows in CyberSourceTransaction
-    start_transaction_id = models.IntegerField()
-    end_transaction_id = models.IntegerField()
-
     sync_started_at = models.DateTimeField(default=datetime.now(pytz.utc))
     sync_ended_at = models.DateTimeField(null=True)
+
+    @classmethod
+    def get_last_sync_date(cls):
+        """
+        Returns the last known sync end-date or None if this has not been done before
+        """
+        last_sync_query = cls.objects.all().order_by('date_range_end').reverse()[:1]
+        if last_sync_query:
+            return last_sync_query[0].date_range_end
+        else:
+            return None
 
 
 class PaymentTransactionSyncError(TimeStampedModel):
@@ -1880,11 +1893,9 @@ class PaymentTransactionSyncError(TimeStampedModel):
         Create and save a new Sync error
         """
 
-        err = PaymentTransactionSyncError(
-            remote_transaction_id=remote_transaction_id,
-            raw_data=raw_data,
-            err_msg=err_msg
-        )
+        err_obj, __ = PaymentTransactionSyncError.objects.get_or_create(remote_transaction_id=remote_transaction_id)
+        err_obj.raw_data = raw_data
+        err_obj.err_msg = err_msg
+        err_obj.save()
 
-        err.save()
-        return err
+        return err_obj
